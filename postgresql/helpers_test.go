@@ -1,8 +1,9 @@
 package postgresql
 
 import (
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -71,7 +72,7 @@ func TestArePrivilegesEqual(t *testing.T) {
 		},
 		{
 			buildResourceData("table", t),
-			buildPrivilegesSet("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"),
+			buildPrivilegesSet("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"),
 			buildPrivilegesSet("ALL"),
 			true,
 		},
