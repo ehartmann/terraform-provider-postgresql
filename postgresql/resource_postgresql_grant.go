@@ -26,6 +26,11 @@ var allowedObjectTypes = []string{
 	"column",
 }
 
+// Here we have something for relkind
+// https://www.postgresql.org/docs/current/catalog-pg-class.html
+// r = ordinary table, i = index, S = sequence, t = TOAST table, v = view, m = materialized view, c = composite type,
+// f = foreign table, p = partitioned table, I = partitioned index
+// ⚠️ Here sequence is S ⚠️
 var objectTypes = map[string]string{
 	"table":    "r",
 	"sequence": "S",
@@ -33,6 +38,18 @@ var objectTypes = map[string]string{
 	"routine":  "f",
 	"type":     "T",
 	"schema":   "n",
+}
+
+// Here we have the ACL default
+// For usage with acldefaults, we are using it only for the table and sequence.
+// https://pgpedia.info/a/acldefault.html
+// c: COLUMN, d: DATABASE, f: FUNCTION or PROCEDURE, F: FOREIGN DATA WRAPPER, l: LANGUAGE
+// L: LARGE OBJECT, n: SCHEMA, p: PARAMETER, r: TABLE and table-like objects, s: SEQUENCE
+// S: FOREIGN SERVER, t: TABLESPACE, T: TYPE or DOMAIN
+// ⚠️ Here sequence is s ⚠️
+var aclDefaultTypes = map[string]string{
+	"table":    "r",
+	"sequence": "s",
 }
 
 type ResourceSchemeGetter func(string) any
@@ -480,13 +497,15 @@ GROUP BY pg_proc.proname
 		return readColumnRolePrivileges(txn, d)
 
 	default:
+		// Here object_type is either table or sequence
+
 		query = `
 SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
 FROM pg_class
 JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
 LEFT JOIN (
     SELECT acls.* FROM (
-        SELECT relname, relnamespace, relkind, (aclexplode(relacl)).* FROM pg_class c
+        SELECT relname, relnamespace, relkind, (aclexplode(coalesce(relacl, acldefault($4, $1)))).* FROM pg_class c
     ) as acls
     WHERE grantee=$1
 ) privs
@@ -495,7 +514,7 @@ WHERE nspname = $2 AND relkind = $3
 GROUP BY pg_class.relname
 `
 		rows, err = txn.Query(
-			query, roleOID, d.Get("schema"), objectTypes[objectType],
+			query, roleOID, d.Get("schema"), objectTypes[objectType], aclDefaultTypes[objectType],
 		)
 	}
 
