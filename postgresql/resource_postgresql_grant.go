@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -488,6 +489,7 @@ LEFT JOIN (
 USING (proname, pronamespace)
       WHERE nspname = $2
 GROUP BY pg_proc.proname
+ORDER BY pg_proc.proname
 `
 		rows, err = txn.Query(
 			query, roleOID, d.Get("schema"),
@@ -499,19 +501,28 @@ GROUP BY pg_proc.proname
 	default:
 		// Here object_type is either table or sequence
 
+		// When relacl IS NULL (e.g. a table freshly created by the application
+		// that never went through an explicit GRANT), PostgreSQL's effective
+		// ACL is acldefault(type, <actual_owner>), which grants the default
+		// privileges to the owner only. Using c.relowner here — as opposed to
+		// the grantee OID — keeps the check honest: if the grantee is not the
+		// owner, the outer WHERE grantee=$1 will not match and drift is
+		// correctly reported. If the grantee is the owner, the implicit
+		// ownership privileges are surfaced, matching PostgreSQL semantics.
 		query = `
 SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
 FROM pg_class
 JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
 LEFT JOIN (
     SELECT acls.* FROM (
-        SELECT relname, relnamespace, relkind, (aclexplode(coalesce(relacl, acldefault($4, $1)))).* FROM pg_class c
+        SELECT relname, relnamespace, relkind, (aclexplode(coalesce(relacl, acldefault($4, c.relowner)))).* FROM pg_class c
     ) as acls
     WHERE grantee=$1
 ) privs
 USING (relname, relnamespace, relkind)
 WHERE nspname = $2 AND relkind = $3
 GROUP BY pg_class.relname
+ORDER BY pg_class.relname
 `
 		rows, err = txn.Query(
 			query, roleOID, d.Get("schema"), objectTypes[objectType], aclDefaultTypes[objectType],
@@ -520,13 +531,17 @@ GROUP BY pg_class.relname
 
 	// This returns, for the specified role (rolname),
 	// the list of all object of the specified type (relkind) in the specified schema (namespace)
-	// with the list of the currently applied privileges (aggregation of privilege_type)
+	// with the list of the currently applied privileges (aggregation of privilege_type).
 	//
-	// Our goal is to check that every object has the same privileges as saved in the state.
+	// We collect the privileges for every object we care about so we can report an
+	// accurate drift representation instead of bailing on the first mismatch.
 	if err != nil {
 		return err
 	}
 
+	defer rows.Close()
+
+	perObject := map[string]*schema.Set{}
 	for rows.Next() {
 		var objName string
 		var privileges pq.ByteaArray
@@ -539,20 +554,120 @@ GROUP BY pg_class.relname
 			continue
 		}
 
-		privilegesSet := pgArrayToSet(privileges)
-		if !resourcePrivilegesEqual(privilegesSet, d) {
-			// If any object doesn't have the same privileges as saved in the state,
-			// we return its privileges to force an update.
-			log.Printf(
-				"[DEBUG] %s %s has not the expected privileges %v for role %s",
-				strings.ToTitle(objectType), objName, privileges, d.Get("role"),
-			)
-			d.Set("privileges", privilegesSet)
-			break
-		}
+		perObject[objName] = pgArrayToSet(privileges)
 	}
 
-	return nil
+	// If the configuration explicitly lists objects but some of them are not
+	// returned by PostgreSQL, they have been dropped out-of-band. We cannot
+	// reconcile this automatically (the objects list is ForceNew, and applying
+	// GRANT on a missing relation would fail). Surface each missing object as a
+	// WARN so operators can update their configuration or recreate the object.
+	warnMissingDeclaredObjects(objects, perObject, objectType, d)
+
+	if len(perObject) == 0 {
+		return nil
+	}
+
+	drifted, driftingObjects := computeDriftedPrivileges(perObject, d)
+	if len(driftingObjects) == 0 {
+		return nil
+	}
+
+	wanted := d.Get("privileges").(*schema.Set)
+	for _, objName := range driftingObjects {
+		privs := perObject[objName]
+		missing := wanted.Difference(privs).List()
+		extra := privs.Difference(wanted).List()
+		log.Printf(
+			"[WARN] postgresql_grant drift on %s %q for role %s: missing=%v extra=%v",
+			objectType, objName, d.Get("role"), missing, extra,
+		)
+	}
+
+	return d.Set("privileges", drifted)
+}
+
+// computeDriftedPrivileges inspects the actual privileges per object fetched
+// from PostgreSQL and returns:
+//   - the set of privileges to persist in state so that `terraform plan` shows a
+//     meaningful diff vs. the desired set (strategy: symmetric difference with
+//     the desired set — state surfaces both missing and extra privileges)
+//   - the sorted list of object names whose privileges differ from the desired
+//     set (used for logging and future surfacing to the user)
+//
+// Strategy (Option C — symmetric-difference with desired set):
+//
+//	state = intersection(actuals) ∪ (union(actuals) − desired)
+//
+// With desired = {SELECT, INSERT} and actuals:
+//
+//	table_a = {SELECT, INSERT, UPDATE}
+//	table_b = {SELECT}
+//	table_c = {SELECT, INSERT}
+//
+// we get intersection = {SELECT}, union = {SELECT, INSERT, UPDATE}, extras =
+// {UPDATE}, so state = {SELECT, UPDATE}. Terraform plan then shows
+// `+ INSERT` (missing on table_b) and `- UPDATE` (extra on table_a).
+func computeDriftedPrivileges(perObject map[string]*schema.Set, d *schema.ResourceData) (*schema.Set, []string) {
+	wanted := d.Get("privileges").(*schema.Set)
+
+	var drifting []string
+	var intersection *schema.Set
+	union := schema.NewSet(schema.HashString, nil)
+
+	for _, objName := range sortedKeys(perObject) {
+		privs := perObject[objName]
+		if !resourcePrivilegesEqual(privs, d) {
+			drifting = append(drifting, objName)
+		}
+		if intersection == nil {
+			intersection = privs
+		} else {
+			intersection = intersection.Intersection(privs)
+		}
+		union = union.Union(privs)
+	}
+
+	if len(drifting) == 0 {
+		return wanted, nil
+	}
+
+	state := intersection.Union(union.Difference(wanted))
+	return state, drifting
+}
+
+func sortedKeys(m map[string]*schema.Set) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// warnMissingDeclaredObjects emits a WARN log for every object listed in the
+// resource configuration that PostgreSQL did not return. This typically means
+// the object was dropped out-of-band: we cannot auto-reconcile (objects is
+// ForceNew and applying GRANT on a missing relation would fail), so we give
+// the operator an actionable signal in the logs without breaking refresh.
+//
+// The check only runs when the user explicitly listed objects; an empty set
+// means "all objects of that type in the schema" and therefore has no missing
+// objects to report.
+func warnMissingDeclaredObjects(objects *schema.Set, perObject map[string]*schema.Set, objectType string, d *schema.ResourceData) {
+	if objects.Len() == 0 {
+		return
+	}
+	for _, obj := range objects.List() {
+		objName := obj.(string)
+		if _, ok := perObject[objName]; ok {
+			continue
+		}
+		log.Printf(
+			"[WARN] postgresql_grant: %s %q declared in `objects` is missing from schema %q; role %q has no privileges on an object that no longer exists. Update the configuration or recreate the object.",
+			objectType, objName, d.Get("schema"), d.Get("role"),
+		)
+	}
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
