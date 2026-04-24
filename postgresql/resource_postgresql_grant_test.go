@@ -1480,6 +1480,77 @@ func TestAccPostgresqlGrantOwnerPG15(t *testing.T) {
 	})
 }
 
+// TestAccPostgresqlGrantDetectsNewTableWithoutACL reproduces the drift detection
+// bug where a table freshly created by another role (relacl IS NULL, grantee is
+// not the owner) incorrectly appeared to have all privileges because the read
+// query used acldefault(type, $grantee) instead of acldefault(type, relowner).
+// After the fix, terraform plan must surface drift on the new table.
+func TestAccPostgresqlGrantDetectsNewTableWithoutACL(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	testTables := []string{"test_schema.existing_table"}
+	createTestTables(t, dbSuffix, testTables, "")
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "%s"
+  role        = "%s"
+  schema      = "test_schema"
+  object_type = "table"
+  privileges  = ["SELECT"]
+}`, dbName, roleName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				// Initial apply grants SELECT on the existing table.
+				Config: tfConfig,
+				Check: resource.ComposeTestCheckFunc(
+					func(*terraform.State) error {
+						return testCheckTablesPrivileges(t, dbName, roleName, testTables, []string{"SELECT"})
+					},
+				),
+			},
+			{
+				// A concurrent actor (the admin here) creates a table in the
+				// managed schema. relacl is NULL and the grantee role is not the
+				// owner, so the role has zero privileges on that new table.
+				PreConfig: func() {
+					config := getTestConfig(t)
+					dbExecute(t, config.connStr(dbName),
+						"CREATE TABLE test_schema.new_table (val text)")
+				},
+				Config:             tfConfig,
+				ExpectNonEmptyPlan: true,
+				PlanOnly:           true,
+			},
+			{
+				// Re-applying converges: both tables end up with SELECT.
+				Config: tfConfig,
+				Check: resource.ComposeTestCheckFunc(
+					func(*terraform.State) error {
+						return testCheckTablesPrivileges(
+							t, dbName, roleName,
+							append(testTables, "test_schema.new_table"),
+							[]string{"SELECT"},
+						)
+					},
+				),
+			},
+		},
+	})
+}
+
 func testCheckDatabasesPrivileges(t *testing.T, canCreate bool) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		db := connectAsTestRole(t, "test_grant_role", "test_grant_db")

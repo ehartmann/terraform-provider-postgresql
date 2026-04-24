@@ -501,13 +501,21 @@ ORDER BY pg_proc.proname
 	default:
 		// Here object_type is either table or sequence
 
+		// When relacl IS NULL (e.g. a table freshly created by the application
+		// that never went through an explicit GRANT), PostgreSQL's effective
+		// ACL is acldefault(type, <actual_owner>), which grants the default
+		// privileges to the owner only. Using c.relowner here — as opposed to
+		// the grantee OID — keeps the check honest: if the grantee is not the
+		// owner, the outer WHERE grantee=$1 will not match and drift is
+		// correctly reported. If the grantee is the owner, the implicit
+		// ownership privileges are surfaced, matching PostgreSQL semantics.
 		query = `
 SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
 FROM pg_class
 JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
 LEFT JOIN (
     SELECT acls.* FROM (
-        SELECT relname, relnamespace, relkind, (aclexplode(coalesce(relacl, acldefault($4, $1)))).* FROM pg_class c
+        SELECT relname, relnamespace, relkind, (aclexplode(coalesce(relacl, acldefault($4, c.relowner)))).* FROM pg_class c
     ) as acls
     WHERE grantee=$1
 ) privs
