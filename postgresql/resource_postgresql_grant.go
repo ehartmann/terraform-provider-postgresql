@@ -557,6 +557,13 @@ ORDER BY pg_class.relname
 		perObject[objName] = pgArrayToSet(privileges)
 	}
 
+	// If the configuration explicitly lists objects but some of them are not
+	// returned by PostgreSQL, they have been dropped out-of-band. We cannot
+	// reconcile this automatically (the objects list is ForceNew, and applying
+	// GRANT on a missing relation would fail). Surface each missing object as a
+	// WARN so operators can update their configuration or recreate the object.
+	warnMissingDeclaredObjects(objects, perObject, objectType, d)
+
 	if len(perObject) == 0 {
 		return nil
 	}
@@ -636,6 +643,31 @@ func sortedKeys(m map[string]*schema.Set) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// warnMissingDeclaredObjects emits a WARN log for every object listed in the
+// resource configuration that PostgreSQL did not return. This typically means
+// the object was dropped out-of-band: we cannot auto-reconcile (objects is
+// ForceNew and applying GRANT on a missing relation would fail), so we give
+// the operator an actionable signal in the logs without breaking refresh.
+//
+// The check only runs when the user explicitly listed objects; an empty set
+// means "all objects of that type in the schema" and therefore has no missing
+// objects to report.
+func warnMissingDeclaredObjects(objects *schema.Set, perObject map[string]*schema.Set, objectType string, d *schema.ResourceData) {
+	if objects.Len() == 0 {
+		return
+	}
+	for _, obj := range objects.List() {
+		objName := obj.(string)
+		if _, ok := perObject[objName]; ok {
+			continue
+		}
+		log.Printf(
+			"[WARN] postgresql_grant: %s %q declared in `objects` is missing from schema %q; role %q has no privileges on an object that no longer exists. Update the configuration or recreate the object.",
+			objectType, objName, d.Get("schema"), d.Get("role"),
+		)
+	}
 }
 
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
